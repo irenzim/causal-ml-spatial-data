@@ -169,7 +169,7 @@ prevention and intervention strategies.
 ```{r echo=FALSE}
 
 # Register your Google Maps API key
-register_google(key = 'AIzaSyDWP8zE8_OxlMiKZVqK5p_Lo2vVb8lSnPw')
+register_google(key = 'xxx')
 # Set a fixed zoom level (adjust as needed)
 zoom <- 12
 
