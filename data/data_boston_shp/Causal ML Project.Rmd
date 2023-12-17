@@ -1,0 +1,48 @@
+```{r}
+if (!require('pacman')) install.packages('pacman')
+pacman::p_load(spdep, #rgdal,
+               maptools, sp, RColorBrewer, e1071, spatstat, 
+               dbscan, sf, ggplot2, raster, lubridate, terra, dplyr, 
+              tsibble, raster, arulesViz, here, DescTools)
+```
+
+```{r}
+path <- here()
+paste0(path, "/Census2020_BG_Neighborhoods.shp")
+```
+
+```{r}
+Boston<-st_read(paste0(path, "/Census2020_BG_Neighborhoods.shp"))
+Boston<-st_transform(Boston, 4326)
+```
+
+```{r}
+plot(Boston$geometry)
+```
+
+```{r}
+crime2015 <- read.csv("tmpzr3l5bxw.csv")
+crime2015
+```
+
+```{r}
+Desc(crime2015)
+```
+
+```{r}
+crime2015 <- na.omit(crime2015)
+
+# Create an sf data frame with a geometry column
+crime2015.sf <- st_as_sf(crime2015, coords = c("Long", "Lat"), crs = 4326)
+
+# Print the resulting sf data frame
+print(crime2015.sf$geometry)
+```
+
+```{r}
+ggplot() +
+  geom_sf(data = Boston$geometry) +
+  geom_sf(data = crime2015.sf$geometry, size = 0.5) +
+  theme_minimal()
+  
+```

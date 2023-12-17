@@ -1,0 +1,600 @@
+---
+title: "Causal ML approach in detecting spatiotemporal crime patterns in Boston"
+author: 
+  - name: Zimovska, Irena
+    url: 
+    affiliation: University of Warsaw, Faculty of Economic Sciences 
+  - name: Usta, Zehra
+    url: 
+    affiliation: University of Warsaw, Faculty of Economic Sciences
+date: "December, 2023"
+output:
+  distill::distill_article:
+    toc: true
+    toc_depth: 2
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+# Preface
+
+In this project, we are aiming to understand and address criminal activities. Analyzing crime rates in Boston involves unraveling the spatio-temporal patterns of criminal incidents to inform targeted interventions and foster safer communities. The objective is to grasp understanding of the dynamics driving criminal behaviors, identify areas of heightened risk.
+
+This analytical exploration aims to investigate crime rates in Boston, employing advanced statistical and spatial analysis techniques such as clustering and explained machine learning. By leveraging spatial analysis methods, this research strives to contribute to the development of actionable insights that can guide policy decisions and community-focused initiatives.
+
+
+
+# Boston Spatial Data
+
+First we load a set of libraries, such as `sf` that allow to
+work conveniently with shape files. Package `pacman` allows to
+conveniently manage package installation and loading - it recognizes
+whether any of the specified packages is not installed in our R
+environment and if so, handles it.
+
+
+```{r message=FALSE, warning=FALSE}
+if (!require('pacman')) install.packages('pacman')
+pacman::p_load(here, DescTools, tidyverse, ggplot2, spdep, #rgdal,
+               maptools, sp, RColorBrewer, e1071, spatstat, 
+               dbscan, sf, ggplot2, raster, lubridate, terra, dplyr, 
+              tsibble, raster, arulesViz, openxlsx, rmdformats, htmltools, knitr, 
+              distill, OpenStreetMap, tidymodels, randomForest, ranger, shapviz, viridis,
+              cowplot, egg, grid, ggmap, Rmisc, kernelshap, ranger)
+```
+
+We gathered the data from [Boston's open data
+hub](https://data.boston.gov). We aggregated the data on
+
+-   crime incident reports from 2015
+    [(Link)](https://data.boston.gov/dataset/crime-incident-reports-august-2015-to-date-source-new-system)
+
+-   census data on Boston neighborhoods (2020)
+    [(Link)](https://data.boston.gov/dataset/2020-census-for-boston)
+
+-   streetlight locations (2016)
+    [(Link)](https://data.boston.gov/dataset/streetlight-locations) ---
+
+Boston is a city with 24 neighborhoods.
+
+```{r message=FALSE, warning=FALSE}
+# load SHP with neighborhoods
+boston_nbhood_sf <- st_read(paste0(here::here(),"/data/Boston_Neighborhood_Boundaries_Approximated_by_2020_Census_Tracts/Boston_Neighborhood_Boundaries_Approximated_by_2020_Census_Tracts.shp"))
+boston_nbhood_sf <-st_transform(boston_nbhood_sf, 4326)
+
+# load SHP with census blocks 
+boston_blocks_sf <- st_read(paste0(here::here(),"/data/Census2020_BlockGroups/Census2020_BlockGroups.shp"))
+boston_blocks_sf <-st_transform(boston_blocks_sf, 4326)
+```
+
+```{r}
+
+# we have 3 columns: 
+# 1) neighborhood name 
+# 2) object id - integer number of the unit (1 to 24) 
+# 3) multipolygon data containing data about the shape (geometry) 
+
+head(boston_nbhood_sf)
+```
+
+```{r, fig.height = 9, fig.width= 8}
+legend_labels <- paste0(boston_nbhood_sf$objectid, ' - ', boston_nbhood_sf$neighborho) 
+
+custom_palette <- viridis(24)
+
+
+
+ggplot(data = boston_nbhood_sf, width = 10, height = 10) +
+  geom_sf(aes(fill = factor(objectid))) +
+  geom_sf_label(aes(label = objectid)) +
+  scale_fill_manual(values = custom_palette, breaks = 1:24, labels = legend_labels, name = " ") +
+  theme(
+    legend.position = 'bottom', 
+    legend.key.width = unit(1, "cm"),
+    axis.title = element_blank(), 
+    plot.title = element_text(face = "bold", size = 16)
+  ) + 
+  ggtitle("Boston Neighborhoods Map")
+
+
+```
+
+------------------------------------------------------------------------
+
+For further analysis however, we will construct upon the block units of
+the city. Those are much smaller than neighborhoods and allow for more
+granular analysis. Blocks shape data can be accessed
+[here](https://data.boston.gov/dataset/census-2020-block-groups).
+
+Overall, there are **581 census blocks**.
+
+```{r, fig.height = 8, fig.width= 8}
+ggplot(data = boston_nbhood_sf, width = 10, height = 10) +
+  geom_sf(aes(fill = factor(objectid), alpha = 0.2)) +
+  scale_fill_manual(values = custom_palette, breaks = 1:24, labels = legend_labels, name = " ") +
+  theme(
+    axis.title = element_blank(), 
+    plot.title = element_text(face = "bold", size = 16)
+  ) + 
+  ggtitle("Boston Neighborhoods & Census Blocks") +
+  labs(fill = NULL) +  # This removes the legend title
+  guides(fill = FALSE, alpha = FALSE) + 
+  geom_sf(data = boston_blocks_sf, color = "#143436", alpha = 0, lwd = 0.4)
+
+```
+
+------------------------------------------------------------------------
+
+
+# Clustering point data
+
+## Hotspot analysis: Kernel density estimation
+
+The first thing that you can do when you obtain point data
+(longitude/latitude) is to make density clustering. This is the first
+step that we do - let's understand whether in general crime incidents
+are more or less satiated at some city areas.
+
+
+```{r}
+crime_data <- readRDS("crime_data.rds")
+crimes_sf <- readRDS('crimes_sf.rds')
+crimes <- readRDS('crimes.rds')
+years <- unique(crimes_sf$YEAR)
+```
+
+The Kernel Density Estimation (KDE) map shows the spatial distribution
+of reported crimes in Boston for the year between 2015 and 2022. Areas
+with darker colors indicate a higher concentration of crime.
+
+In 2015, KDE map shows that crime is concentrated in the downtown area,
+particularly around the intersection of Massachusetts Avenue and
+Washington Street. There are also secondary clusters of crime in the
+neighborhoods of Roxbury, Dorchester, and Mattapan.
+
+The patterns seem similar for the years 2015, 2016, 2017 and 2018,
+although there is a small change in density, the location of crime
+hotspots is almost the same. Especially after 2019 we can see that
+density in the downtown area getting smaller. In the year 2020 and 2021
+there are four small hotspots instead of two. Crimes are getting more
+spreaded compared to previous years. For the year 2022 we observe lower
+density hotspots compared to previous years.
+
+Overall, the KDE map for crime in Boston between 2015 and 2022 provides
+a valuable tool for understanding the spatial distribution of crime in
+the city. This information can be used to develop targeted crime
+prevention and intervention strategies.
+
+```{r echo=FALSE}
+
+# Register your Google Maps API key
+register_google(key = 'AIzaSyDWP8zE8_OxlMiKZVqK5p_Lo2vVb8lSnPw')
+# Set a fixed zoom level (adjust as needed)
+zoom <- 12
+
+# Get the map of Boston using qmap with Google Maps
+boston_map <- qmap(location = 'Boston', zoom = zoom, maptype = 'roadmap')
+
+```
+
+```{r echo=FALSE}
+# Extract the coordinates from the sf object
+# boston_map <- qmap(location = 'Boston', zoom = zoom)
+# Function to create crime density plots with a background map
+
+create_density_plot <- function(year) {
+  # Subset data for the current year
+  subset_year <- crimes_sf %>% filter(YEAR == year)
+  
+  # Extract coordinates
+  coords <- st_coordinates(subset_year$geometry) %>% 
+    data.frame() %>%
+    setNames(c("lon", "lat"))
+
+  # Get a background map using ggmap
+  boston_map <- get_map(location = c(lon = -71.0589, lat = 42.3601), zoom = 12)
+
+  # Create the crime density plot
+  density_plot <- ggplot() +
+    ggtitle(year) + 
+    annotation_raster(boston_map, xmin = -71.2, xmax = -70.9, ymin = 42.2, ymax = 42.40) +
+    geom_sf(data = crimes_sf$geometry, fill = "white", color = "black", alpha = 0) +
+    
+    stat_density_2d(
+      data = coords,
+      aes(x = lon, y = lat, fill = ..level.., alpha = ..level..),
+      geom = "polygon", size = 0.2
+    ) +
+    
+    scale_fill_viridis_c(option = "C", name = "Counts") +
+    scale_alpha(range = c(0.4, 0.8)) +
+    theme(legend.position = "top", axis.title = element_blank()) + 
+    guides(alpha = FALSE)
+
+  return(density_plot)
+}
+
+# Use map to create a list of crime density plots
+plots <- map(years, create_density_plot)
+
+# Example: Print the first plot
+# print(plots[[1]])
+```
+
+```{r include=FALSE}
+legend <-get_legend(plots[[1]])
+
+```
+
+```{r echo=FALSE, fig.height=14, fig.width=7}
+grid.arrange(legend, arrangeGrob(plots[[1]] + theme(legend.position = "none"),
+            plots[[2]] + theme(axis.text.y = element_blank(),
+                     axis.ticks.y = element_blank(),
+                     axis.title.y = element_blank(), 
+                     legend.position = "none"),
+          
+          plots[[3]]+ theme(legend.position = "none"), 
+          
+          plots[[4]] + theme(axis.text.y = element_blank(),
+                     axis.ticks.y = element_blank(),
+                     axis.title.y = element_blank(), 
+                     legend.position = "none"), 
+          
+          plots[[5]]+ theme(legend.position = "none"), 
+          
+          plots[[6]] + theme(axis.text.y = element_blank(),
+                     axis.ticks.y = element_blank(),
+                     axis.title.y = element_blank(), 
+                     legend.position = "none"), 
+          
+          plots[[7]] + theme(legend.position = "none"), 
+          
+          plots[[8]] + theme(axis.text.y = element_blank(),
+                     axis.ticks.y = element_blank(),
+                     axis.title.y = element_blank(), 
+                     legend.position = "none"),
+          ncol = 2),
+          nrow = 2, heights = c(1, 15), 
+          top = textGrob("Crime density in Boston 2015-2022", gp = gpar(fontsize = 16, fontface = "bold")))
+```
+
+## DBSCAN clustering
+
+In our analysis we condider 4 types of incidents: 
+- Robbery 
+- Auto Theft 
+- Homicide 
+- Vandalism
+
+```{r}
+# omit missing data in longitude and latitude 
+# those cannot be imputed and are not useful for analysis this way
+crimes <- crimes %>%
+  filter(!is.na(Lat) & !is.na(Long))
+```
+
+
+```{r}
+
+robberies <- crimes %>% filter(OFFENSE_CODE_GROUP == "Robbery")
+
+auto_thefts <- crimes %>% filter(OFFENSE_CODE_GROUP == "Auto Theft")
+
+homicides <- crimes %>% filter(OFFENSE_CODE_GROUP == "Homicide")
+
+vandalism <- crimes %>% filter(OFFENSE_CODE_GROUP == "Vandalism")
+```
+
+```{r}
+#coords <- st_coordinates(robberies$geometry) %>% data.frame
+
+boston_map <- qmap(location = 'Boston', zoom = 12, maptype = 'roadmap')
+```
+
+
+```{r}
+dbscan_rob <- dbscan(robberies[,c('Long', 'Lat')], eps = 0.002, minPts = 80)
+robberies$cluster_label <- dbscan_rob$cluster
+
+# Filter out noise points (cluster label -1)
+robberies <- robberies[robberies$cluster_label != 0, ]
+
+custom_pallette <- brewer.pal(6, "Dark2")
+
+plot1<- boston_map +
+  geom_point(data = robberies, aes(x = Long, y= Lat), size = 1, alpha = 0.3, color = '#cc1865', stroke = 0.5) +
+  scale_color_manual(values = brewer.pal(6, "Set1")) + 
+  theme(legend.position = "none", 
+        plot.title = element_text(face = "bold", size = 14)) + 
+  ggtitle("Robberies")
+
+```
+
+```{r}
+#coords <- st_coordinates(robberies$geometry) %>% data.frame
+
+dbscan_auto <- dbscan(auto_thefts[,c('Long', 'Lat')], eps = 0.002, minPts = 80)
+auto_thefts$cluster_label <- dbscan_auto$cluster
+
+# Filter out noise points (cluster label -1)
+auto_thefts <- auto_thefts[auto_thefts$cluster_label != 0, ]
+
+plot2<- boston_map +
+  geom_point(data = auto_thefts, aes(x = Long, y= Lat), size = 1, alpha = 0.3, color = '#cc1865', stroke = 0.5) +
+  #scale_color_manual(values = brewer.pal(6, "Set1")) + 
+  theme(legend.position = "none", 
+        plot.title = element_text(face = "bold", size = 14)) + 
+  ggtitle("Auto thefts")
+
+```
+
+```{r}
+#coords <- st_coordinates(robberies$geometry) %>% data.frame
+
+dbscan_hom <- dbscan(homicides[,c('Long', 'Lat')], eps = 0.002, minPts = 80)
+homicides$cluster_label <- dbscan_hom$cluster
+
+# Filter out noise points (cluster label -1)
+#homicides <- homicides[homicides$cluster_label != 0, ]
+
+plot3<- boston_map +
+  geom_point(data = homicides, aes(x = Long, y= Lat), size = 1, 
+             alpha = 0.3, color = '#cc1865', stroke = 0.5) +
+  #scale_color_manual(values = brewer.pal(31, "Set1")) + 
+  theme(legend.position = "none", 
+        plot.title = element_text(face = "bold", size = 14)) + 
+  ggtitle("Homicides")
+
+```
+
+```{r}
+#coords <- st_coordinates(robberies$geometry) %>% data.frame
+
+dbscan_vandal <- dbscan(vandalism[,c('Long', 'Lat')], eps = 0.002, minPts = 80)
+vandalism$cluster_label <- dbscan_vandal$cluster
+
+# Filter out noise points (cluster label -1)
+vandalism <- vandalism[vandalism$cluster_label != 0, ]
+
+plot4<- boston_map +
+  geom_point(data = vandalism, aes(x = Long, y= Lat), size = 1, 
+             alpha = 0.3, color = '#cc1865', stroke = 0.5) +
+  #scale_color_manual(values = brewer.pal(31, "Set1")) + 
+  theme(legend.position = "none", 
+        plot.title = element_text(face = "bold", size = 14)) + 
+  ggtitle("Vandalism")
+
+```
+
+```{r, fig.height=10, fig.width= 8}
+multiplot(plot1, plot2, plot3, plot4, cols = 2)
+```
+
+## Streetlights and population density
+
+Up to now we were performing explanatory analysis based on point data.
+To proceed further with an ML model, we would to set up analysis based
+on Boston census blocks. Let's preview how the density of streetlights
+and population are distributed.
+
+```{r, fig.width=12, fig.height=8}
+plot5 <- ggplot(data = crime_data) + 
+  geom_sf(aes(fill = streetlights_density)) +
+  scale_fill_gradient(
+    low = "#03045e", high = "#faa307", 
+    na.value = "grey90",
+    aesthetics = "fill",
+    name = "Index"
+  ) + 
+  ggtitle("Streetlight density")+ 
+  theme(plot.title = element_text(face = "bold", size = 14), 
+        legend.position = "left")
+
+plot5
+```
+
+```{r, fig.width=12, fig.height=9}
+plot6 <- ggplot(data = crime_data) + 
+  geom_sf(aes(fill = P0020001)) +
+  scale_fill_gradient(
+    low = "white", high = "#d42b74", 
+    na.value = "#4fe51a",
+    aesthetics = "fill",
+    name = "Count"
+  ) + 
+  ggtitle("Population counts")+ 
+  theme(plot.title = element_text(face = "bold", size = 14), 
+        legend.position = "left")
+
+plot6
+```
+
+```{r, fig.width=12, fig.height=9}
+#grid.arrange(plot5, plot6, nrow = 1)
+```
+
+
+
+
+# Random Forest & Model Interpretation
+
+
+
+## Spatial lags estimation
+
+Apart other variables, we would like to include into the model spatial lags. 
+
+Including spatial lags in a model is essential when dealing with spatial data to account for the spatial dependencies and interactions that may exist among neighboring observations. Spatial lags capture the influence of neighboring units on the variable of interest, acknowledging that observations in close proximity may share similarities or exhibit spatial patterns. Ignoring spatial autocorrelation can lead to biased parameter estimates and unreliable inference, as standard statistical models assume independence among observations.
+
+To calculate those, `spdep` package is used.
+```{r}
+w <- poly2nb(crime_data$geometry)
+w <- nb2listw(w,style="W", zero.policy = TRUE)
+```
+
+
+One way to identify any spatial autocorrelation present in data is to
+perform Moran's I test. It is calculated based on spatial weight matrix.
+
+$$ I = \frac{n}{W} \frac{\sum_{i=1}^{n}\sum_{j=1}^{n} w_{ij}(x_i - \bar{x})(x_j - \bar{x})}{\sum_{i=1}^{n}(x_i - \bar{x})^2} $$
+
+where:
+
+-    $n$ is the number of spatial units,
+
+-    $W$ is the spatial weights matrix,
+
+-   $x_i$ and $x_j$ are the values of the variable of interest at
+    locations $i$ and $j$,
+
+-    $\bar{x}$ is the mean of the variable of interest,
+
+-    $w_{ij}$ is the spatial weight between locations $i$ and $j$.
+
+
+```{r}
+variable <- crime_data$crime_rate
+moran_i <- moran.test(variable, w, zero.policy = TRUE)
+print(moran_i)
+```
+
+
+**The Moran I statistic** ranges from -1 to 1.A **positive value** indicates spatial clustering (similar values are close to each other). A **negative value** suggests spatial dispersion (dissimilar values are close to each other).
+In this case, the value is positive but small, indicating a small tendency toward spatial correlation. 
+
+
+**The expectation** is the average value of Moran's I under the assumption of spatial randomness. The expectation is slightly negative, which indicates a slight tendency toward spatial dispersion under the assumption of randomness.
+
+Now we would like to aggregate spatial weight into spatial lags for each spatial unit in Boston, considering the defined spatial relationships between these units. The resulting spatial lag values provide information about the average crime rates in neighboring areas for each location in the dataset. This type of analysis is common in spatial statistics and helps account for spatial dependencies when examining the distribution of a variable across different locations.
+
+
+```{r}
+# spatial lag aggregation
+crime_data$spatial_lag<- lag.listw(w, crime_data$crime_rate)
+```
+
+
+```{r}
+crime_data <- crime_data %>% filter(!is.na(spatial_lag))
+```
+
+## Model fit
+In the model we include: 
+
+1) streetlight density (streetlight counts/polygon area in km2)
+2) spatial lag 
+3) P0020002 (proportion of Hispanic or Latino per block)
+4) P0020005 (proportion of White alone per block)
+5) P0020006 (proportion of Black or African American alone)
+6) P0020008 (proportion of Asian alone)
+
+```{r}
+rf_model <- ranger(
+  crime_rate ~ streetlights_density + spatial_lag + 
+   P0020002+ P0020005 + P0020006
+  + P0020008, 
+  data = as.data.frame(crime_data), 
+  num.trees = 100,
+  seed = 20
+)
+
+
+rf_model
+```
+
+
+## Interpretable ML
+
+
+```{r}
+crime_data <- st_join(crime_data, boston_nbhood_sf, join = st_covered_by)
+```
+
+```{r message=FALSE}
+# we will take a few neighborhoods to create chapley values 
+nb_check <- c("Hyde Park", "Mattapan", "Roslindale", "Jamaica Plain")
+
+
+bg_X <- crime_data %>% filter(neighborho %in% nb_check) %>% dplyr::select(streetlights_density, spatial_lag, P0020002, P0020005, P0020006, P0020008)
+```
+
+```{r}
+# set up parameters for kernelSHAP
+X <- crime_data %>% dplyr::select(streetlights_density, spatial_lag, P0020002, P0020005, P0020006, P0020008) %>% st_drop_geometry()
+```
+
+
+### Kernel & Permutation SHAP
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+# 3) Crunch SHAP values for all rows of X 
+# Note: Since the number of features is small, we use permshap()
+ps <- permshap(rf_model, as.data.frame(X), bg_X = as.data.frame(bg_X))
+ps
+```
+
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+ks <- kernelshap(rf_model, as.data.frame(X), bg_X = as.data.frame(bg_X))
+ks
+```
+
+```{r}
+ps <- shapviz(ps)
+```
+
+
+So the plot below shows crime rate prediction equal to 0.0305. 
+
+### Inividual prediction plots
+
+- **Waterfall & force plots**
+
+At this plot we can observe the effect of features on one individual prediction. 
+First, it shows us the expected value of crime rate of examined sample - 
+$$E[f(x)]$$, which is 0.347 in our case. Next, the value of prediction is $$f(x)$$. 
+
+For the chosen block, the predicted crime rate is  0.0264. 
+
+So the individual effects of variables are represented by Shapley values: 
+In our case, P0020002 significantly decreased the predicted crime rate. 
+
+Opposite to what we expected the streetlight density increases crime rate - 
+this might be caused by the fact that more streetlights are located in more densely 
+populated polygons - and as observed from DBSCAN results, quite a few clusters are located 
+in city centre. 
+
+```{r}
+# Two types of visualizations
+sv_waterfall(ps, row_id = 1)
+sv_force(ps, row_id = 1)
+```
+
+We may check the effects for one another observation. As observed, generally the effects of 
+features work pretty in the same way. 
+
+```{r}
+sv_waterfall(ps, row_id = 11)
+sv_force(ps, row_id = 11)
+```
+
+### Absolute mean SHAP plot 
+
+To check the common shapley values for the whole sample, we use common feature importance plot: 
+the presented values are the absolute value of the mean shapley values for the whole set of observations. 
+
+We conclude that: 
+
+The ethnic demographic proportions have more significant affect according to the model than streetlight density and spatial lags. 
+
+```{r}
+sv_importance(ps, show_numbers = TRUE, alpha = 0.8)
+```
+
+
+```{r eval=FALSE, include=FALSE}
+xvars <- c('streetlights_density',  'P0020002', 'P0020005', 'P0020006', 'P0020007', 'P0020008', 'P0020009', 'P0020010', 'P0020011')
+sv_dependence(ps, xvars)
+```
+

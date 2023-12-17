@@ -1,0 +1,422 @@
+---
+title: "Causal ML approach in detecting spatiotemporal crime patterns in Boston"
+author: 
+  - name: Zimovska, Irena
+    url: 
+    affiliation: University of Warsaw, Faculty of Economic Sciences 
+  - name: Usta, Zehra
+    url: 
+    affiliation: University of Warsaw, Faculty of Economic Sciences
+date: "December, 2023"
+output: distill::distill_article
+---
+
+
+
+# 1. Upload packages & data
+
+
+```{r message=FALSE, warning=FALSE}
+if (!require('pacman')) install.packages('pacman')
+pacman::p_load(here, DescTools, tidyverse, ggplot2, spdep, #rgdal,
+               maptools, sp, RColorBrewer, e1071, spatstat, 
+               dbscan, sf, ggplot2, raster, lubridate, terra, dplyr, 
+              tsibble, raster, arulesViz, openxlsx, rmdformats, prettydoc, htmltools, knitr, 
+              distill, OpenStreetMap, tidymodels, randomForest, ranger, shapviz)
+```
+
+
+## Census 2020 Data
+
+```{r}
+# data aggregated by blocks 
+census_blocks <- read.csv(paste0(here::here(),'/data/census-block-group-data.csv'), header = TRUE)
+# data aggregated by neighbourhoods
+census_nbhood <- read.csv(paste0(here::here(),'/data/census-neighbourhood-data.csv'), header = TRUE)
+
+# we can omit the row with description 
+census_blocks <- census_blocks %>% slice(-1)
+census_nbhood <- census_nbhood %>% slice(-1)
+
+# verifying whether totals for population are the same 
+popSum_blocks <- sum(as.numeric(census_blocks$P0020001))
+popSum_nbhood <- sum(as.numeric(census_nbhood$P0020001))
+```
+
+## Sreetlights 2016 data
+
+```{r}
+streetlights <- read.csv(paste0(here::here(), "/data/streetlight-locations.csv"))
+
+```
+
+## Crime data 2015-2022
+
+For crimes we need to: \* join the data for years \* impute offense descriptions where those are missing
+
+```{r}
+# File paths for each CSV file
+
+# general path - here package 
+
+path <- paste0(here::here(), "/data/data_crimes/")
+
+year_list <- c('2015.csv', '2016.csv', '2017.csv', '2018.csv',
+               '2019.csv', '2020.csv', '2021.csv', '2022.csv')
+
+# Create an empty data frame to store the merged data
+crimes <- data.frame()
+
+# Loop through each file and read data into thedata frame
+for (year in year_list) {
+  # Read data from the CSV file
+  data <- read.csv(paste0(path, year), header = TRUE)  # Adjust other arguments as needed
+  
+  # Append data to the merged_data data frame
+  crimes <- rbind(crimes, data)
+}
+```
+
+For 2019 we lack data in the field `OFFENSE_CODE_GROUP`, so we may impute those values 
+from external .csv which has descriptions for `OFFENSE_CODE`.
+
+```{r}
+offense_codes <- read.xlsx(paste0(here::here(), "/data/offense_codes.xlsx"))
+#head(offense_codes)
+offense_codes <- offense_codes %>% dplyr::rename(OFFENSE_CODE = CODE) %>%
+  # per one numeric code sometimes there are two or more rows with descriptions, 
+  # but we want to keep only unique rows to make a left join with crimes df further 
+  distinct(OFFENSE_CODE, .keep_all = TRUE)
+head(offense_codes)
+```
+
+```{r}
+# we left join the descriptions 
+crimes <- crimes %>% 
+  left_join(offense_codes, by = "OFFENSE_CODE") %>% 
+  dplyr::select(-OFFENSE_DESCRIPTION)
+```
+
+```{r}
+Desc(crimes)
+```
+Apart all the missings, 5.4 % of the data frame does not have information about 
+longitude and latitude of the crime. We would omit those, as they cannot be further 
+aggregated. 
+
+```{r}
+# omit missing data in longitude and latitude 
+# those cannot be imputed and are not useful for analysis this way
+crimes <- crimes %>%
+  filter(!is.na(Lat) & !is.na(Long))
+```
+
+
+```{r}
+unique(crimes$OFFENSE_CODE_GROUP)
+
+crime_groups <- c('Robbery', 'Auto Theft', 'Homicide', 'Vandalism')
+```
+
+```{r}
+# we need to record codes for chosen offenses, becuase OFFENSE_CODE_GROUP 
+# contains NA's
+crime_codes_df <- crimes %>%
+  filter(OFFENSE_CODE_GROUP %in% crime_groups) %>%
+  distinct(OFFENSE_CODE_GROUP, OFFENSE_CODE)
+```
+
+```{r}
+# make a list from data frame column 
+crime_codes <- crime_codes_df %>% dplyr::select(OFFENSE_CODE) %>% pull()
+```
+
+```{r}
+# Filter out crime types 
+crimes <- crimes %>% filter(OFFENSE_CODE %in% crime_codes) %>% dplyr::select(-OFFENSE_CODE_GROUP) %>% left_join(crime_codes_df, by = 'OFFENSE_CODE')
+```
+
+## Boston shape data: by Census blocks 
+
+Creating an SHP object is necessary.
+
+
+```{r}
+# load SHP with census blocks 
+boston_blocks_sf <- st_read(paste0(here::here(),"/data/Census2020_BlockGroups/Census2020_BlockGroups.shp"))
+boston_blocks_sf <-st_transform(boston_blocks_sf, 4326)
+```
+
+
+```{r}
+# load SHP with neighbourhoods 
+boston_nbhood_sf <- st_read(paste0(here::here(),"/data/Boston_Neighborhood_Boundaries_Approximated_by_2020_Census_Tracts/Boston_Neighborhood_Boundaries_Approximated_by_2020_Census_Tracts.shp"))
+boston_nbhood_sf <-st_transform(boston_nbhood_sf, 4326)
+```
+
+```{r}
+# the plot of census blocks
+ggplot() +
+  # layer for blocks 
+  geom_sf(data = boston_blocks_sf, fill = "#44b6bb", color = "#143436", alpha = 0.3)+ 
+  #layer for nwighbourhoods
+  geom_sf(data = boston_nbhood_sf, color = "#d42b4d", alpha = 0.1, lwd = 0.5) + 
+  ggtitle("Map of Boston neighbourhoods and blocks")+ 
+  theme_light()
+  #theme(plot.title = element_text(face = "bold"))
+```
+ 
+
+
+# Preparing crime data as shp 
+
+```{r}
+crimes_sf <- st_as_sf(crimes, coords = c("Long", "Lat"), crs = 4326)
+```
+
+
+
+```{r}
+# the function transforms:
+# 1500000US250250001011 => 250250001011 so that keys in shp and census data were the same for further merging 
+# Function to extract numeric part using regular expression
+
+extract_numeric_part <- function(id_code) {
+  return(sub(".*?(\\d+)$", "\\1", id_code))
+}
+
+# Apply the function to the column
+census_blocks$GEOID <- sapply(census_blocks$GEOID, extract_numeric_part)
+
+# Print the result
+print(census_blocks)
+
+```
+
+# CRIME COUNTS
+
+```{r}
+boston_blocks_sf <- merge(boston_blocks_sf, census_blocks[,c('GEOID', 'P0020001', 'P0020002', 'P0020005', 'P0020006', 'P0020007', 'P0020008','P0020009', 'P0020010', 'P0020011')], by.x = "GEOID20", by.y = "GEOID", all = T)
+```
+
+
+```{r}
+boston_blocks_sf <- boston_blocks_sf %>%
+  filter(!is.na(OBJECTID))
+```
+
+
+
+```{r}
+# crimes_sf have point data of crimes and Boston_blocks is 
+# polygon data 
+# we merge then to count crimes per polygon
+joined_data <- st_join(boston_blocks_sf, crimes_sf)
+```
+
+
+```{r}
+aggregated_data <- joined_data %>% group_by(GEOID20) %>% dplyr::summarise(crime_count = n()) %>% dplyr::rename(GEOID = GEOID20)
+```
+
+```{r}
+ggplot(data = aggregated_data) + geom_sf(aes(fill = crime_count))
+```
+
+
+```{r}
+crime_count_per_area <- as.data.frame(table(joined_data$GEOID20))
+colnames(crime_count_per_area) <- c("GEOID", "crime_count")
+```
+
+
+
+```{r}
+crime_count_per_area <- merge(crime_count_per_area, census_blocks[,c('GEOID', 'P0020001', 'P0020002', 'P0020005', 'P0020006', 'P0020007', 'P0020008','P0020009', 'P0020010', 'P0020011')], by.x = "GEOID", by.y = "GEOID", all = TRUE)
+```
+
+
+We face a problem - some polygons have 0 population. We don't know why this happens. But this prevents us from calculating crime rate for this areas.
+
+So, we want to impute 0's by some other numbers. 
+
+First, investigation is to decide how. 
+
+
+
+
+
+```{r}
+#offense_counts_type <- joined_data %>% group_by(GEOID20, OFFENSE_CODE_GROUP) %>% count()
+```
+
+```{r}
+# Pivot the data to wide format
+#wide_data <- offense_counts_type %>%
+  #spread(OFFENSE_CODE_GROUP, n, fill = 0) %>% 
+  #rename(GEOID = GEOID20)
+
+```
+
+
+
+```{r}
+
+```
+
+1. We have Boston dataset with shp borders of census blocks 
+2. We have census data per block (GEOID20 is the key id for each block)
+
+3. At the end we have data frame with 581 rows and columns: 
+  * GEOID 
+  * crime count 
+  * crime rate 
+  * demographic variables 
+  * streetlights count / some estimate (how to calculate the area of the block?)
+
+----
+what we did: 
+
+1) the crime rates per block are DONE 
+2) light counts per block TO DO 
+3) we need crime types 
+we have also kernel 
+
+# LIGHT COUNTS 
+
+Let us preview again the Boston lights data.
+
+```{r}
+glimpse(streetlights)
+```
+We have point data that should be transformed into sf. 
+
+
+```{r}
+head(streetlights)
+```
+
+```{r}
+streetlights_sf <- st_as_sf(streetlights, coords = c("Long", "Lat"), crs = 4326)
+```
+
+
+```{r}
+joined_data <- st_join(boston_blocks_sf, streetlights_sf)
+```
+
+```{r}
+light_count <- joined_data %>% dplyr::count(GEOID20, name = 'streetlights_count') %>% dplyr::rename(GEOID = GEOID20)
+```
+
+
+```{r}
+crime_count_per_area <- crime_count_per_area %>% left_join(light_count, by = "GEOID") 
+```
+
+
+
+```{r}
+crime_count_per_area$P0020002 <- as.numeric(crime_count_per_area$P0020002)
+
+crime_count_per_area$P0020005 <- as.numeric(crime_count_per_area$P0020005)
+
+crime_count_per_area$P0020006 <- as.numeric(crime_count_per_area$P0020006)
+
+crime_count_per_area$P0020007 <- as.numeric(crime_count_per_area$P0020007)
+
+crime_count_per_area$P0020008 <- as.numeric(crime_count_per_area$P0020008)
+
+crime_count_per_area$P0020009 <- as.numeric(crime_count_per_area$P0020009)
+
+crime_count_per_area$P0020010 <- as.numeric(crime_count_per_area$P0020010)
+
+crime_count_per_area$P0020011 <- as.numeric(crime_count_per_area$P0020011)
+```
+
+
+For light density we divide number of streetlights by the area of a block. 
+
+
+```{r}
+crime_count_per_area <- st_as_sf(crime_count_per_area)
+crime_count_per_area$area_km2 <- as.numeric(st_area(crime_count_per_area)/1e6)
+```
+
+```{r}
+# calculate crime rate per block 
+crime_count_per_area <- crime_count_per_area %>% mutate(streetlights_density = streetlights_count/area_km2)
+```
+
+
+
+```{r}
+# 581 unique blocks 
+crime_count_per_area %>% dplyr::select(GEOID) %>% unique() %>% count()
+
+crime_count_per_area %>% dplyr::select(GEOID, P0020001, crime_count) %>%
+  arrange(P0020001) 
+```
+
+```{r}
+ggplot(data = crime_count_per_area) + 
+  geom_sf(aes(fill = factor(P0020001 == 0))) +
+  ggtitle("Missing population")+ 
+  theme(plot.title = element_text(face = "bold", size = 14), 
+        legend.position = "left")
+
+```
+
+```{r}
+library(dplyr)
+
+# Assuming your data frame is called crime_count_per_area
+crime_count_per_area <- crime_count_per_area %>%
+  mutate(P0020001 = ifelse(P0020001 == 0, 1, P0020001))
+
+
+
+```
+
+
+
+```{r}
+# calculate crime rate per block 
+crime_count_per_area <- crime_count_per_area %>% filter(!is.na(P0020001)) %>% mutate(crime_count = as.numeric(crime_count), 
+                                                         P0020001 = as.numeric(P0020001), 
+                                                         crime_rate = crime_count/P0020001)
+
+crime_count_per_area <- crime_count_per_area %>% filter(!is.na(crime_count))
+```
+
+```{r}
+crimes %>% filter(OFFENSE_CODE == 301 & YEAR == 2019) 
+```
+```{r}
+spare_mtx_rook <- poly2nb(as(crime_count_per_area, "Spatial"), queen = FALSE)
+```
+
+
+```{r}
+w <- nb2listw(spare_mtx_rook,style="W", zero.policy = TRUE)
+crime_count_per_area$spatial_lag<- lag.listw(w, crime_count_per_area$crime_rate)
+
+#as.data.frame(data[, c("crime_rate", "spatial_lag_crime")])
+```
+
+```{r}
+columns_to_divide <- c('P0020002', 'P0020005', 'P0020006', 'P0020007', 'P0020008', 'P0020009', 'P0020010', 'P0020011')
+
+for (i in columns_to_divide) { 
+  crime_count_per_area[, i] <- crime_count_per_area[, i] / crime_count_per_area$P0020001
+}
+
+```
+
+
+
+
+```{r}
+saveRDS(crime_count_per_area, file = 'crime_data.rds')
+```
+
