@@ -261,11 +261,7 @@ grid.arrange(legend, arrangeGrob(plots[[1]] + theme(legend.position = "none"),
 
 ## DBSCAN clustering
 
-In our analysis we condider 4 types of incidents: 
-- Robbery 
-- Auto Theft 
-- Homicide 
-- Vandalism
+
 
 ```{r}
 # omit missing data in longitude and latitude 
@@ -311,14 +307,14 @@ plot1<- boston_map +
 
 ```
 
-```{r}
+```{r include=FALSE}
 #coords <- st_coordinates(robberies$geometry) %>% data.frame
 
 dbscan_auto <- dbscan(auto_thefts[,c('Long', 'Lat')], eps = 0.002, minPts = 80)
 auto_thefts$cluster_label <- dbscan_auto$cluster
 
 # Filter out noise points (cluster label -1)
-auto_thefts <- auto_thefts[auto_thefts$cluster_label != 0, ]
+#auto_thefts <- auto_thefts[auto_thefts$cluster_label != 0, ]
 
 plot2<- boston_map +
   geom_point(data = auto_thefts, aes(x = Long, y= Lat), size = 1, alpha = 0.3, color = '#cc1865', stroke = 0.5) +
@@ -329,7 +325,7 @@ plot2<- boston_map +
 
 ```
 
-```{r}
+```{r include=FALSE}
 #coords <- st_coordinates(robberies$geometry) %>% data.frame
 
 dbscan_hom <- dbscan(homicides[,c('Long', 'Lat')], eps = 0.002, minPts = 80)
@@ -367,8 +363,8 @@ plot4<- boston_map +
 
 ```
 
-```{r, fig.height=10, fig.width= 8}
-multiplot(plot1, plot2, plot3, plot4, cols = 2)
+```{r, fig.height=8, fig.width= 10}
+multiplot(plot1, plot4, cols = 2)
 ```
 
 ## Streetlights and population density
